@@ -6,6 +6,9 @@ import mediapipe as mp
 import numpy as np
 import pyvirtualcam
 
+from video_pipeline import LatestFrameCapture,LatestAnalysis,FramePacer,VideoStats,configure_video_processing,tracking_image
+from preview_controls import MirrorControl
+
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
@@ -21,6 +24,7 @@ SAD_MEME_PATH = BASE_DIR / "memes" / "sad.png"
 ME_MEME_PATH = BASE_DIR / "memes" / "me.png"
 STOP_MEME_PATH = BASE_DIR / "memes" / "stop.png"
 CALMA_MEME_PATH = BASE_DIR / "memes" / "calma.jpg"
+OK_MEME_PATH = BASE_DIR / "memes" / "memeok.jpg"
 
 WINDOW_NAME = "Meme Pose Tracker"
 CAMERA_WIDTH = 960
@@ -62,12 +66,19 @@ def open_camera(index=0):
         # ridimensionato solo dopo l'acquisizione, per la visualizzazione.
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_WIDTH)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, VIRTUAL_CAMERA_FPS)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # DirectShow can reset the codec when size/FPS changes. Set MJPEG LAST:
+        # requesting it before the resolution silently falls back to slow YUY2.
+        cap.set(cv2.CAP_PROP_FOURCC,cv2.VideoWriter_fourcc(*'MJPG'))
 
         for _ in range(30):
             ok, frame = cap.read()
             if ok and frame is not None and frame.size:
-                print(f"[WEBCAM] Backend attivo: {backend_name}")
-                return cap, frame
+                code=int(cap.get(cv2.CAP_PROP_FOURCC))
+                codec=''.join(chr((code>>8*i)&255) for i in range(4)).strip('\x00')
+                print(f"[WEBCAM] {backend_name}: {frame.shape[1]}x{frame.shape[0]}, formato {codec or 'automatico'}")
+                return LatestFrameCapture(cap,frame), None
             time.sleep(0.05)
 
         attempts.append(f"{backend_name}: aperta, ma nessun frame ricevuto")
@@ -183,6 +194,82 @@ def extended_finger_states(landmarks):
 def extended_finger_count(landmarks):
     """Conta indice, medio, anulare e mignolo visibilmente distesi."""
     return sum(extended_finger_states(landmarks))
+
+
+def thumbs_up_pose(hands, face_box):
+    """Riconosce una mano chiusa con il solo pollice disteso verso l'alto."""
+    if not hands or face_box is None:
+        return False, 0.0
+
+    # Valuta ogni mano separatamente: il gesto deve funzionare anche quando
+    # MediaPipe vede una seconda mano che non sta facendo il pollice alzato.
+    if len(hands) > 1:
+        results = [thumbs_up_pose([hand], face_box) for hand in hands]
+        return max(results, key=lambda result: (result[0], result[1]))
+
+    fx1, fy1, fx2, fy2 = face_box
+    face_width = max(0.001, fx2 - fx1)
+    face_height = max(0.001, fy2 - fy1)
+    face_center_x = (fx1 + fx2) / 2
+
+    hand = hand_features(hands[0])
+    landmarks = hand["landmarks"]
+    palm_x, palm_y = hand["center"]
+
+    wrist = np.array([landmarks[WRIST].x, landmarks[WRIST].y])
+    thumb_mcp = np.array([landmarks[2].x, landmarks[2].y])
+    thumb_ip = np.array([landmarks[3].x, landmarks[3].y])
+    thumb_tip = np.array([landmarks[4].x, landmarks[4].y])
+    middle_mcp = np.array([landmarks[9].x, landmarks[9].y])
+    palm_scale = max(0.001, float(np.linalg.norm(middle_mcp - wrist)))
+
+    thumb_axis = thumb_tip - thumb_mcp
+    thumb_length = float(np.linalg.norm(thumb_axis))
+    thumb_rise = float(thumb_mcp[1] - thumb_tip[1])
+    thumb_points_up = (
+        thumb_tip[1] < thumb_ip[1] < thumb_mcp[1]
+        and thumb_rise >= 0.48 * palm_scale
+        and abs(thumb_axis[0]) <= 0.78 * thumb_rise
+    )
+
+    # I due segmenti del pollice devono essere quasi allineati: cosi una mano
+    # chiusa con il pollice ripiegato non viene scambiata per un "OK".
+    lower_thumb = thumb_ip - thumb_mcp
+    upper_thumb = thumb_tip - thumb_ip
+    lower_length = max(0.001, float(np.linalg.norm(lower_thumb)))
+    upper_length = max(0.001, float(np.linalg.norm(upper_thumb)))
+    thumb_alignment = float(
+        np.dot(lower_thumb, upper_thumb) / (lower_length * upper_length)
+    )
+    thumb_extended = thumb_length >= 0.62 * palm_scale and thumb_alignment >= 0.55
+
+    # Indice, medio, anulare e mignolo devono rimanere ripiegati nel pugno.
+    folded_fingers = not any(extended_finger_states(landmarks))
+
+    hx1, hy1, hx2, hy2 = hand["bbox"]
+    hand_width = hx2 - hx1
+    hand_height = hy2 - hy1
+    visible_size = (
+        hand_width >= 0.20 * face_width
+        and hand_height >= 0.38 * face_height
+    )
+    near_upper_body = (
+        abs(palm_x - face_center_x) <= 1.65 * face_width
+        and fy1 - 0.55 * face_height <= palm_y <= fy2 + 1.90 * face_height
+    )
+
+    direction_score = min(1.0, max(0.0, thumb_rise / (0.85 * palm_scale)))
+    alignment_score = min(1.0, max(0.0, (thumb_alignment + 1.0) / 2.0))
+    fold_score = 1.0 if folded_fingers else 0.0
+    score = float(np.mean([direction_score, alignment_score, fold_score]))
+    matched = (
+        thumb_points_up
+        and thumb_extended
+        and folded_fingers
+        and visible_size
+        and near_upper_body
+    )
+    return matched, score
 
 
 def calma_hand_pose(hands, face_box):
@@ -750,7 +837,7 @@ def overlay_meme_on_face(frame, meme, face_box):
     )
 
 
-def main():
+def run_meme_webcam():
     memes = {
         "two_hands": load_meme(MEME_PATH),
         "hearing": load_meme(HEARING_MEME_PATH),
@@ -759,6 +846,7 @@ def main():
         "me": load_meme(ME_MEME_PATH),
         "stop": load_meme(STOP_MEME_PATH),
         "calma": load_meme(CALMA_MEME_PATH),
+        "ok": load_meme(OK_MEME_PATH),
     }
 
     face_options = mp_vision.FaceLandmarkerOptions(
@@ -808,6 +896,9 @@ def main():
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, CAMERA_WIDTH, CAMERA_HEIGHT)
+    mirror=MirrorControl(CAMERA_WIDTH,CAMERA_HEIGHT)
+    cv2.setMouseCallback(WINDOW_NAME,mirror.on_mouse)
+    mirror_generation=mirror.generation
 
     last_face_box = None
     last_face_time = 0.0
@@ -820,8 +911,28 @@ def main():
     start_time = time.monotonic()
     camera_read_failures = 0
 
+    def analyze(payload):
+        raw,stamp,submitted_at,generation=payload
+        image=tracking_image(raw)
+        faces=face_landmarker.detect_for_video(image,stamp).face_landmarks
+        hands=hand_landmarker.detect_for_video(image,stamp).hand_landmarks
+        return faces,hands,submitted_at,generation
+
+    def close_models():
+        try:
+            face_landmarker.close()
+        finally:
+            hand_landmarker.close()
+
+    analysis=LatestAnalysis(analyze,cleanup=close_models)
+    analyzed_sequence=-1
+    detected_hands=[]
+    pacer=FramePacer(VIRTUAL_CAMERA_FPS)
+    stats=VideoStats('Meme Webcam')
+
     try:
         while True:
+            frame_started=time.perf_counter()
             if pending_frame is not None:
                 frame = pending_frame
                 pending_frame = None
@@ -839,23 +950,31 @@ def main():
                 )
             camera_read_failures = 0
 
-            frame = cv2.flip(frame, 1)
+            if mirror.generation!=mirror_generation:
+                mirror_generation=mirror.generation
+                last_face_box=None
+                last_face_time=0
+                detected_hands=[]
+                squares={}
+                candidate_pose=active_pose=None
+                candidate_frames=miss_frames=0
+                confidence=0
+            if mirror.mirrored:
+                frame = cv2.flip(frame, 1)
             frame = cv2.resize(frame, (CAMERA_WIDTH, CAMERA_HEIGHT))
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            timestamp_ms = int((time.monotonic() - start_time) * 1000)
-
-            face_result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
-            hand_result = hand_landmarker.detect_for_video(mp_image, timestamp_ms)
-
             now = time.monotonic()
-            if face_result.face_landmarks:
-                last_face_box = face_bounding_box(face_result.face_landmarks[0])
-                last_face_time = now
-            elif now - last_face_time > 1.2:
+            timestamp_ms = int((now-start_time)*1000)
+            analysis.submit((frame.copy(),timestamp_ms,now,mirror_generation))
+            tracked=analysis.latest()
+            if (tracked is not None and tracked.sequence!=analyzed_sequence
+                    and tracked.data[3]==mirror_generation):
+                analyzed_sequence=tracked.sequence
+                faces,detected_hands,tracked_at,_=tracked.data
+                if faces:
+                    last_face_box=face_bounding_box(faces[0])
+                    last_face_time=tracked_at
+            if now-last_face_time>1.2:
                 last_face_box = None
-
-            detected_hands = hand_result.hand_landmarks
             squares = update_squares(
                 detected_hands,
                 squares,
@@ -891,10 +1010,17 @@ def main():
                 detected_hands,
                 last_face_box,
             )
+            ok_match, ok_confidence = thumbs_up_pose(
+                detected_hands,
+                last_face_box,
+            )
 
-            # Le mani dietro la testa sono molto separate e hanno precedenza
-            # sul gesto con le mani unite davanti al volto.
-            if memeomg_match:
+            # Il pollice alzato ha precedenza: basta che una delle mani faccia
+            # il gesto, anche quando una seconda mano e visibile nel frame.
+            if ok_match:
+                detected_pose = "ok"
+                current_confidence = ok_confidence
+            elif memeomg_match:
                 detected_pose = "memeomg"
                 current_confidence = memeomg_confidence
             elif stop_match:
@@ -925,6 +1051,7 @@ def main():
                     sad_confidence,
                     me_confidence,
                     stop_confidence,
+                    ok_confidence,
                 )
 
             confidence = 0.72 * confidence + 0.28 * current_confidence
@@ -971,6 +1098,8 @@ def main():
                 status = "INDICAZIONE SU DI ME RILEVATA"
             elif active_pose == "stop":
                 status = "GESTO TIMEOUT RILEVATO"
+            elif active_pose == "ok":
+                status = "POLLICE ALZATO RILEVATO"
             elif active_pose == "two_hands":
                 status = "POSE DUE MANI RILEVATA"
             else:
@@ -1007,21 +1136,37 @@ def main():
                 cv2.LINE_AA,
             )
 
-            # Lo stesso frame mostrato a schermo viene pubblicato come webcam.
+            # Preview-only buttons stay out of the virtual camera.
             virtual_camera.send(frame)
-            cv2.imshow(WINDOW_NAME, frame)
+            cv2.imshow(WINDOW_NAME, mirror.draw(frame))
 
             key = cv2.waitKey(1) & 0xFF
             if key == 27 or key == ord("q"):
                 break
-            virtual_camera.sleep_until_next_frame()
+            if key==ord('m'):
+                mirror.toggle()
+            stats.tick(tracked)
+            pacer.wait(frame_started)
 
     finally:
+        analysis.close()
         virtual_camera.close()
         cap.release()
         cv2.destroyAllWindows()
-        face_landmarker.close()
-        hand_landmarker.close()
+
+
+def main():
+    from webcam_domains import choose_effect, run_domain_webcam
+
+    configure_video_processing()
+    effect = choose_effect()
+    if effect == "meme":
+        return run_meme_webcam()
+    if effect in ("gojo", "sukuna"):
+        return run_domain_webcam(
+            effect, open_camera, width=CAMERA_WIDTH, height=CAMERA_HEIGHT,
+            fps=VIRTUAL_CAMERA_FPS,
+        )
 
 
 if __name__ == "__main__":
